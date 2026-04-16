@@ -31,6 +31,16 @@ ALLEGRO_TOKEN_URL = "https://allegro.pl/auth/oauth/token"
 _local_tasks: Dict[str, Dict[str, Any]] = {}
 _local_tasks_lock = threading.Lock()
 
+def _clean_credential(value: str) -> str:
+    v = (value or "").strip()
+    if len(v) >= 2 and v[0] == "`" and v[-1] == "`":
+        v = v[1:-1].strip()
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1].strip()
+    if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+        v = v[1:-1].strip()
+    return v
+
 
 def _should_use_local_tasks() -> bool:
     try:
@@ -151,12 +161,12 @@ def allegro_auth_start(
     current_user: User = Depends(get_current_verified_user),
     db: Session = Depends(get_db)
 ):
-    client_id = os.getenv("ALLEGRO_CLIENT_ID") or ""
-    client_secret = os.getenv("ALLEGRO_CLIENT_SECRET") or ""
+    client_id = _clean_credential(os.getenv("ALLEGRO_CLIENT_ID"))
+    client_secret = _clean_credential(os.getenv("ALLEGRO_CLIENT_SECRET"))
     if (not client_id or not client_secret) or client_id == "DUMMY" or client_secret == "DUMMY":
         env_values = dotenv_values(Path(__file__).resolve().parents[4] / ".env")
-        client_id = str(env_values.get("ALLEGRO_CLIENT_ID") or "")
-        client_secret = str(env_values.get("ALLEGRO_CLIENT_SECRET") or "")
+        client_id = _clean_credential(str(env_values.get("ALLEGRO_CLIENT_ID") or ""))
+        client_secret = _clean_credential(str(env_values.get("ALLEGRO_CLIENT_SECRET") or ""))
     if not client_id or not client_secret or client_id == "DUMMY" or client_secret == "DUMMY":
         raise HTTPException(
             status_code=400,

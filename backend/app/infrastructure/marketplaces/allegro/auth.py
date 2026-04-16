@@ -15,15 +15,25 @@ logger = logging.getLogger(__name__)
 ALLEGRO_API_URL = "https://api.allegro.pl"
 ALLEGRO_AUTH_URL = "https://allegro.pl"
 
+def _clean_credential(value: str) -> str:
+    v = (value or "").strip()
+    if len(v) >= 2 and v[0] == "`" and v[-1] == "`":
+        v = v[1:-1].strip()
+    if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+        v = v[1:-1].strip()
+    if len(v) >= 2 and v[0] == "'" and v[-1] == "'":
+        v = v[1:-1].strip()
+    return v
+
 def _get_credentials() -> tuple[str, str]:
-    client_id = os.getenv("ALLEGRO_CLIENT_ID") or ""
-    client_secret = os.getenv("ALLEGRO_CLIENT_SECRET") or ""
+    client_id = _clean_credential(os.getenv("ALLEGRO_CLIENT_ID"))
+    client_secret = _clean_credential(os.getenv("ALLEGRO_CLIENT_SECRET"))
     if client_id and client_secret and client_id != "DUMMY" and client_secret != "DUMMY":
         return client_id, client_secret
 
     env_values = dotenv_values(Path(__file__).resolve().parents[5] / ".env")
-    client_id = str(env_values.get("ALLEGRO_CLIENT_ID") or "")
-    client_secret = str(env_values.get("ALLEGRO_CLIENT_SECRET") or "")
+    client_id = _clean_credential(str(env_values.get("ALLEGRO_CLIENT_ID") or ""))
+    client_secret = _clean_credential(str(env_values.get("ALLEGRO_CLIENT_SECRET") or ""))
     return client_id, client_secret
 
 
