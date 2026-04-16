@@ -1,0 +1,56 @@
+.env
+.env.dev
+.env.local
+.env.development
+.env.prod
+.env.bak
+.env.client
+
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+backend/.venv/
+
+node_modules/
+*/node_modules/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+*.pyc
+*/*.pyc
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+backend/app.db
+database/
+
+# Sensitive export files with access tokens - NEVER COMMIT!
+local_accounts_export.csv
+local_accounts_export.sql
+*_accounts_export.csv
+*_accounts_export.sql

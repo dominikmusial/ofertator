@@ -1,0 +1,358 @@
+name: Deploy Client Version (Eurohit) to Production
+
+on:
+  push:
+    branches: [ feature/mirakl ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+    - name: Build and push backend image (client version)
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile.prod
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-backend-client:latest
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-backend-client:${{ env.IMAGE_TAG }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push frontend image (client version)
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        file: ./frontend/Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-frontend-client:latest
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-frontend-client:${{ env.IMAGE_TAG }}
+        build-args: |
+          VITE_GOOGLE_CLIENT_ID=
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Deploy to Client Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_CLIENT_VM_IP }}
+        username: ${{ secrets.GCP_CLIENT_VM_USER }}
+        key: ${{ secrets.GCP_CLIENT_VM_SSH_KEY }}
+        script: |
+          sudo mkdir -p /opt/bot-sok-client
+          sudo chown ubuntu:ubuntu /opt/bot-sok-client
+          cd /opt/bot-sok-client
+          
+          echo "🚀 Starting client deployment of commit ${{ env.IMAGE_TAG }}..."
+          
+          # Create backup of current running images for rollback
+          echo "📦 Creating backup for rollback..."
+          sudo docker compose -f docker-compose.client.prod.yml images --format json > deployment_backup.json 2>/dev/null || echo "No previous deployment"
+
+    - name: Copy production files to client server
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.GCP_CLIENT_VM_IP }}
+        username: ${{ secrets.GCP_CLIENT_VM_USER }}
+        key: ${{ secrets.GCP_CLIENT_VM_SSH_KEY }}
+        source: "docker-compose.client.prod.yml,deploy/client/*.sh,deploy/env.client.prod.example,frontend/nginx.client.conf,backend/scripts/seed_client_config.py"
+        target: "/opt/bot-sok-client/"
+        overwrite: true
+
+    - name: Setup client production environment
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_CLIENT_VM_IP }}
+        username: ${{ secrets.GCP_CLIENT_VM_USER }}
+        key: ${{ secrets.GCP_CLIENT_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok-client
+          
+          # Copy environment template if .env.client.prod doesn't exist
+          if [ ! -f ".env.client.prod" ]; then
+            echo "⚠️  .env.client.prod not found. Creating from template..."
+            cp deploy/env.client.prod.example .env.client.prod
+            echo "❌ ERROR: Please configure .env.client.prod on the server before deploying!"
+            echo "📄 Edit: /opt/bot-sok-client/.env.client.prod"
+            exit 1
+          fi
+          
+          # Use .env.client.prod for production
+          rm -f .env
+          cp .env.client.prod .env
+          echo "✅ Using .env.client.prod for client production environment"
+          
+          # Make scripts executable
+          chmod +x deploy/client/*.sh 2>/dev/null || true
+
+    - name: Continue client deployment
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_CLIENT_VM_IP }}
+        username: ${{ secrets.GCP_CLIENT_VM_USER }}
+        key: ${{ secrets.GCP_CLIENT_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok-client
+          
+          # Ensure SSL certificates exist (temporary self-signed if Let's Encrypt not setup yet)
+          echo "🔐 Checking SSL certificates..."
+          mkdir -p ssl
+          
+          # Check if Let's Encrypt certificates exist (use sudo because certs are owned by root)
+          if sudo test -f "/etc/letsencrypt/live/eurohit-ofertator.vautomate.pl/fullchain.pem"; then
+            echo "✅ Let's Encrypt certificates found - keeping nginx configured for Let's Encrypt"
+            # Ensure nginx config points to Let's Encrypt (in case it was manually changed)
+            sed -i.bak \
+              -e 's|ssl_certificate /etc/nginx/ssl/nginx-selfsigned.crt;|ssl_certificate /etc/letsencrypt/live/eurohit-ofertator.vautomate.pl/fullchain.pem;|' \
+              -e 's|ssl_certificate_key /etc/nginx/ssl/nginx-selfsigned.key;|ssl_certificate_key /etc/letsencrypt/live/eurohit-ofertator.vautomate.pl/privkey.pem;|' \
+              frontend/nginx.client.conf
+          else
+            echo "⚠️  Let's Encrypt certificates NOT found"
+            # Create self-signed certificates if they don't exist
+            if [ ! -f "ssl/nginx-selfsigned.crt" ] || [ ! -f "ssl/nginx-selfsigned.key" ]; then
+              echo "🔧 Creating temporary self-signed SSL certificates..."
+              openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                -keyout ssl/nginx-selfsigned.key \
+                -out ssl/nginx-selfsigned.crt \
+                -subj "/C=PL/ST=Poland/L=Warsaw/O=Eurohit/CN=eurohit-ofertator.vautomate.pl"
+              echo "✅ Temporary SSL certificates created"
+            fi
+            # Update nginx config to use self-signed certs
+            echo "🔧 Configuring nginx to use self-signed certificates..."
+            sed -i.bak \
+              -e 's|ssl_certificate /etc/letsencrypt/live/eurohit-ofertator.vautomate.pl/fullchain.pem;|ssl_certificate /etc/nginx/ssl/nginx-selfsigned.crt;|' \
+              -e 's|ssl_certificate_key /etc/letsencrypt/live/eurohit-ofertator.vautomate.pl/privkey.pem;|ssl_certificate_key /etc/nginx/ssl/nginx-selfsigned.key;|' \
+              frontend/nginx.client.conf
+            echo "⚠️  WARNING: Using self-signed certificates. Run Let's Encrypt setup after first deployment."
+          fi
+          
+          # Pull latest images
+          echo "📥 Pulling latest client images..."
+          sudo docker pull ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-backend-client:latest
+          sudo docker pull ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-frontend-client:latest
+          
+          # Validate environment variables
+          echo "🔍 Validating client environment variables..."
+          
+          # Check required variables
+          required_vars="POSTGRES_PASSWORD SECRET_KEY GEMINI_API_KEY CLIENT_ADMIN_EMAIL CLIENT_ADMIN_PASSWORD DOCKER_HUB_USERNAME"
+          missing_vars=""
+          
+          for var in $required_vars; do
+            if ! grep -q "^${var}=.\\+" .env; then
+              missing_vars="$missing_vars $var"
+            fi
+          done
+          
+          if [ ! -z "$missing_vars" ]; then
+            echo "❌ Missing required environment variables:$missing_vars"
+            echo "📄 Please update /opt/bot-sok-client/.env.client.prod"
+            exit 1
+          fi
+          
+          echo "✅ Environment variables validated successfully"
+          
+          # Run database migrations
+          echo "🗄️  Running database migrations..."
+          
+          # Start database first if not running
+          sudo docker compose -f docker-compose.client.prod.yml up -d db-client redis-client
+          sleep 10
+          
+          # Run migrations
+          sudo docker compose -f docker-compose.client.prod.yml run --rm backend-client alembic upgrade head
+          
+          if [ $? -ne 0 ]; then
+            echo "❌ Migration failed!"
+            exit 1
+          fi
+          
+          echo "✅ Migrations completed successfully"
+          
+          # Stop services gracefully
+          echo "⏹️  Stopping services..."
+          sudo docker compose -f docker-compose.client.prod.yml down --remove-orphans
+          
+          # Start services with new images
+          echo "🚀 Starting client services with new images..."
+          sudo docker compose -f docker-compose.client.prod.yml up -d
+          
+          # Wait for services to initialize
+          echo "⏳ Waiting for services to initialize..."
+          sleep 30
+          
+          # Seed client configuration (feature flags + admin account)
+          echo "🌱 Seeding client configuration..."
+          sudo docker compose -f docker-compose.client.prod.yml exec -T backend-client python scripts/seed_client_config.py --client-mode
+          
+          if [ $? -ne 0 ]; then
+            echo "⚠️  Client configuration seeding failed, but continuing..."
+          else
+            echo "✅ Client configuration seeded successfully"
+          fi
+          
+          # Health checks with proper error handling
+          echo "🏥 Running health checks..."
+          
+          # Backend health check (increased timeout to 4 minutes total)
+          BACKEND_HEALTHY=false
+          for i in {1..48}; do
+            if sudo docker compose -f docker-compose.client.prod.yml exec -T backend-client python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" 2>/dev/null; then
+              echo "✅ Backend is healthy (attempt $i/48)"
+              BACKEND_HEALTHY=true
+              break
+            else
+              echo "⏳ Backend not ready yet, attempt $i/48..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$BACKEND_HEALTHY" = false ]; then
+            echo "❌ Backend health check failed!"
+            echo "Backend container status:"
+            sudo docker compose -f docker-compose.client.prod.yml ps backend-client
+            echo ""
+            echo "=== BACKEND LOGS ==="
+            sudo docker compose -f docker-compose.client.prod.yml logs backend-client --tail=50
+            exit 1
+          fi
+          
+          # Frontend health check  
+          FRONTEND_HEALTHY=false
+          for i in {1..12}; do
+            if curl -f -k -m 10 https://eurohit-ofertator.vautomate.pl/health >/dev/null 2>&1; then
+              echo "✅ Frontend is healthy"
+              FRONTEND_HEALTHY=true
+              break
+            else
+              echo "⏳ Frontend not ready yet, attempt $i/12..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$FRONTEND_HEALTHY" = false ]; then
+            echo "❌ Frontend health check failed!"
+            echo "Nginx logs:"
+            sudo docker compose -f docker-compose.client.prod.yml logs nginx-client --tail=30
+            exit 1
+          fi
+          
+          # Test API connectivity
+          echo "🧪 Testing API connectivity..."
+          if curl -f -k -m 10 -H "Accept: application/json" https://eurohit-ofertator.vautomate.pl/api/v1/config/feature-flags >/dev/null 2>&1; then
+            echo "✅ API is accessible and feature flags endpoint working"
+          else
+            echo "⚠️  API test failed, but continuing (may require authentication)"
+          fi
+          
+          # Clean up old images
+          echo "🧹 Cleaning up old images..."
+          sudo docker image prune -f
+          
+          # Final status report
+          echo "📊 Final deployment status:"
+          sudo docker compose -f docker-compose.client.prod.yml ps
+          
+          echo "✅ Client deployment completed successfully!"
+          echo "🌐 Application: https://eurohit-ofertator.vautomate.pl"
+          echo "📝 Commit: ${{ env.IMAGE_TAG }}"
+          echo "🕒 Deployed at: $(date)"
+          echo ""
+          echo "⚠️  REMEMBER: If using self-signed certificates, run Let's Encrypt setup:"
+          echo "   cd /opt/bot-sok-client && ./deploy/client/setup-letsencrypt.sh"
+
+    - name: Rollback on failure
+      if: failure()
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_CLIENT_VM_IP }}
+        username: ${{ secrets.GCP_CLIENT_VM_USER }}
+        key: ${{ secrets.GCP_CLIENT_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok-client
+          echo "🔄 Deployment failed! Starting rollback..."
+          
+          # Stop current failed deployment
+          sudo docker compose -f docker-compose.client.prod.yml down --remove-orphans
+          
+          # Try to restore using backup if available
+          if [ -f "deployment_backup.json" ]; then
+            echo "📋 Found deployment backup, attempting restore..."
+            
+            # Extract previous image tags from backup
+            PREV_BACKEND=$(cat deployment_backup.json | jq -r '.[] | select(.Service == "backend-client") | .Repository + ":" + .Tag' | head -1)
+            PREV_FRONTEND=$(cat deployment_backup.json | jq -r '.[] | select(.Service == "nginx-client") | .Repository + ":" + .Tag' | head -1)
+            
+            if [ "$PREV_BACKEND" != "null:null" ] && [ "$PREV_FRONTEND" != "null:null" ]; then
+              echo "🔄 Pulling previous images..."
+              sudo docker pull "$PREV_BACKEND" || echo "⚠️  Could not pull previous backend image"
+              sudo docker pull "$PREV_FRONTEND" || echo "⚠️  Could not pull previous frontend image"
+            fi
+          fi
+          
+          # Start services (will use previously cached images if pull failed)
+          echo "🔄 Starting services..."
+          sudo docker compose -f docker-compose.client.prod.yml up -d
+          
+          # Wait and check if rollback succeeded
+          sleep 30
+          if sudo docker compose -f docker-compose.client.prod.yml exec -T backend-client python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" 2>/dev/null; then
+            echo "✅ Rollback successful - backend is responding"
+          else
+            echo "❌ Rollback failed - manual intervention required"
+            echo "Recent logs:"
+            sudo docker compose -f docker-compose.client.prod.yml logs --tail=20
+          fi
+          
+          echo "🔍 Please check the system manually and investigate the deployment failure"
+
+    - name: Cleanup on success
+      if: success()
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_CLIENT_VM_IP }}
+        username: ${{ secrets.GCP_CLIENT_VM_USER }}
+        key: ${{ secrets.GCP_CLIENT_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok-client
+          
+          # Remove backup files
+          rm -f deployment_backup.json
+          
+          # Remove old unused images (keep last 3 versions)
+          echo "🧹 Cleaning up old images..."
+          sudo docker image prune -f
+          
+          echo "✨ Cleanup completed"
+
+    - name: Notify deployment result
+      if: always()
+      run: |
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "✅ Client deployment successful!"
+          echo "🌐 Application: https://eurohit-ofertator.vautomate.pl"
+          echo "📝 Commit: ${{ env.IMAGE_TAG }}"
+        else
+          echo "❌ Client deployment failed!"
+          echo "📝 Failed commit: ${{ env.IMAGE_TAG }}"
+          echo "🔄 Rollback attempted"
+        fi

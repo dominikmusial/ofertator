@@ -1,0 +1,192 @@
+services:
+  # PostgreSQL Database for Client
+  db-client:
+    image: postgres:15
+    container_name: bot-sok-db-client
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-allegro_bot_client}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data_client:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"  # Different port to avoid conflict
+    networks:
+      - bot-sok-client
+    restart: unless-stopped
+
+  # Redis for Client
+  redis-client:
+    image: redis:7-alpine
+    container_name: bot-sok-redis-client
+    ports:
+      - "6381:6379"  # Different port
+    volumes:
+      - redis_data_client:/data
+    networks:
+      - bot-sok-client
+    restart: unless-stopped
+
+  # MinIO for Client
+  minio-client:
+    image: minio/minio:latest
+    container_name: bot-sok-minio-client
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command: server /data --console-address ":9001"
+    ports:
+      - "9001:9000"  # API port (different)
+      - "9091:9001"  # Console port (different)
+    volumes:
+      - minio_data_client:/data
+    networks:
+      - bot-sok-client
+    restart: unless-stopped
+
+  # Backend for Client
+  backend-client:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bot-sok-backend-client
+    environment:
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db-client:5432/${POSTGRES_DB:-allegro_bot_client}
+      POSTGRES_SERVER: db-client
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-allegro_bot_client}
+      
+      # Redis/Celery
+      CELERY_BROKER_URL: redis://redis-client:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-client:6379/0
+      
+      # MinIO
+      MINIO_ENDPOINT: minio-client:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET_NAME: allegro-bot-client
+      MINIO_USE_SSL: "false"
+      MINIO_EXTERNAL_ENDPOINT: ${MINIO_EXTERNAL_ENDPOINT:-http://localhost:9001}
+      
+      # Application
+      SECRET_KEY: ${SECRET_KEY}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5174}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-120}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      
+      # Allegro (if needed)
+      ALLEGRO_CLIENT_ID: ${ALLEGRO_CLIENT_ID}
+      ALLEGRO_CLIENT_SECRET: ${ALLEGRO_CLIENT_SECRET}
+      
+      # AI
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      
+      # Email
+      MAIL_SERVER: ${MAIL_SERVER}
+      MAIL_PORT: ${MAIL_PORT:-587}
+      MAIL_USERNAME: ${MAIL_USERNAME}
+      MAIL_PASSWORD: ${MAIL_PASSWORD}
+      MAIL_FROM: ${MAIL_FROM}
+      MAIL_USE_TLS: ${MAIL_USE_TLS:-true}
+      
+      # Google OAuth
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI}
+      
+      # Admin
+      DEFAULT_ADMIN_EMAIL: ${CLIENT_ADMIN_EMAIL:-admin@client.com}
+      DEFAULT_ADMIN_PASSWORD: ${CLIENT_ADMIN_PASSWORD:-changeme}
+    depends_on:
+      - db-client
+      - redis-client
+      - minio-client
+    ports:
+      - "8001:8000"  # Different port
+    networks:
+      - bot-sok-client
+    restart: unless-stopped
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Celery Worker for Client
+  worker-client:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bot-sok-worker-client
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db-client:5432/${POSTGRES_DB:-allegro_bot_client}
+      CELERY_BROKER_URL: redis://redis-client:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-client:6379/0
+      MINIO_ENDPOINT: minio-client:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET_NAME: allegro-bot-client
+      MINIO_USE_SSL: "false"
+      ALLEGRO_CLIENT_ID: ${ALLEGRO_CLIENT_ID}
+      ALLEGRO_CLIENT_SECRET: ${ALLEGRO_CLIENT_SECRET}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    depends_on:
+      - db-client
+      - redis-client
+      - minio-client
+    networks:
+      - bot-sok-client
+    restart: unless-stopped
+    volumes:
+      - ./backend:/app
+    command: celery -A app.celery_worker worker --loglevel=info
+
+  # Celery Beat for Client
+  beat-client:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bot-sok-beat-client
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db-client:5432/${POSTGRES_DB:-allegro_bot_client}
+      CELERY_BROKER_URL: redis://redis-client:6379/0
+      CELERY_RESULT_BACKEND: redis://redis-client:6379/0
+    depends_on:
+      - db-client
+      - redis-client
+    networks:
+      - bot-sok-client
+    restart: unless-stopped
+    volumes:
+      - ./backend:/app
+    command: celery -A app.celery_worker beat --loglevel=info
+
+  # Frontend for Client (Dev mode - not production build)
+  frontend-client:
+    image: node:20-alpine
+    container_name: bot-sok-frontend-client
+    working_dir: /app
+    environment:
+      VITE_API_URL: http://localhost:8001/api/v1
+      VITE_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+    ports:
+      - "5174:5173"  # Different port
+    networks:
+      - bot-sok-client
+    restart: unless-stopped
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules_client:/app/node_modules
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+
+networks:
+  bot-sok-client:
+    driver: bridge
+
+volumes:
+  postgres_data_client:
+  redis_data_client:
+  minio_data_client:
+  frontend_node_modules_client:

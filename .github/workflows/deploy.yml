@@ -1,0 +1,357 @@
+name: Deploy to GCP VM
+
+on:
+  push:
+    branches: [ staging ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+    - name: Build and push backend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile.prod
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-backend:latest
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-backend:${{ env.IMAGE_TAG }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push frontend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        file: ./frontend/Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-frontend:latest
+          ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-frontend:${{ env.IMAGE_TAG }}
+        build-args: |
+          VITE_GOOGLE_CLIENT_ID=${{ secrets.VITE_GOOGLE_CLIENT_ID }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Deploy to GCP VM
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_VM_IP }}
+        username: ${{ secrets.GCP_VM_USER }}
+        key: ${{ secrets.GCP_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok
+          
+          echo "🚀 Starting deployment of commit ${{ env.IMAGE_TAG }}..."
+          
+          # Create backup of current running images for rollback
+          echo "📦 Creating backup for rollback..."
+          docker compose -f docker-compose.prod.yml images --format json > deployment_backup.json
+
+    - name: Copy production files
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.GCP_VM_IP }}
+        username: ${{ secrets.GCP_VM_USER }}
+        key: ${{ secrets.GCP_VM_SSH_KEY }}
+        source: "docker-compose.prod.yml,deploy/validate-migrations.sh,deploy/validate-env-vars.sh,deploy/merge-env-prod.sh,deploy/update-env-prod.sh,deploy/env.prod.example,frontend/nginx.conf"
+        target: "/opt/bot-sok/"
+        overwrite: true
+
+    - name: Setup production environment
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_VM_IP }}
+        username: ${{ secrets.GCP_VM_USER }}
+        key: ${{ secrets.GCP_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok
+          
+          # Automatically merge new variables from template into .env.prod
+          # This preserves existing production values while adding any new variables
+          echo "🔄 Merging new variables from template into .env.prod..."
+          chmod +x deploy/merge-env-prod.sh
+          
+          if ./deploy/merge-env-prod.sh; then
+            echo "✅ Environment variables merged successfully"
+          else
+            echo "❌ Failed to merge environment variables"
+            exit 1
+          fi
+          
+          # Always use .env.prod for production
+          rm -f .env  # Remove old .env file
+          cp .env.prod .env
+          echo "✅ Using .env.prod for production environment"
+          
+          # Clean up obsolete files
+          echo "🧹 Removing obsolete files..."
+          rm -f docker-compose.ssl.yml docker-compose.vm.yml renew-ssl.sh
+          rm -f docker-compose.prod.yml.backup docker-compose.prod.yml.ssl-backup
+          echo "✅ Cleaned up obsolete files"
+
+    - name: Continue deployment
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_VM_IP }}
+        username: ${{ secrets.GCP_VM_USER }}
+        key: ${{ secrets.GCP_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok
+          
+          # Ensure SSL certificates exist
+          echo "🔐 Checking SSL certificates..."
+          mkdir -p ssl
+          if [ ! -f "ssl/nginx-selfsigned.crt" ] || [ ! -f "ssl/nginx-selfsigned.key" ]; then
+            echo "⚠️  Creating self-signed SSL certificates..."
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+              -keyout ssl/nginx-selfsigned.key \
+              -out ssl/nginx-selfsigned.crt \
+              -subj "/C=US/ST=State/L=City/O=Organization/CN=ofertator.vautomate.pl"
+            echo "✅ SSL certificates created"
+          fi
+          
+          # Pull latest images
+          echo "📥 Pulling latest images..."
+          docker pull ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-backend:latest
+          docker pull ${{ secrets.DOCKER_HUB_USERNAME }}/bot-sok-frontend:latest
+          
+          # Validate environment variables
+          echo "🔍 Validating environment variables..."
+          chmod +x deploy/validate-env-vars.sh
+          if ! ENV_FILE=.env ./deploy/validate-env-vars.sh; then
+            echo "❌ Environment variable validation failed"
+            echo "💡 Please update .env.prod file on the server with missing variables"
+            echo "📄 Reference: deploy/env.prod.example"
+            exit 1
+          fi
+          echo "✅ Environment variables validated successfully"
+          
+          # Run database migrations with comprehensive safeguards
+          echo "🗄️  Running database migrations with comprehensive safety checks..."
+          
+          # Make migration script executable
+          chmod +x deploy/validate-migrations.sh
+          
+          # Run comprehensive migration validation and application
+          ./deploy/validate-migrations.sh
+          MIGRATION_EXIT_CODE=$?
+          
+          if [ $MIGRATION_EXIT_CODE -eq 1 ]; then
+            echo "❌ Critical migration validation failure"
+            echo "🔍 Checking system state for debugging..."
+            docker compose -f docker-compose.prod.yml logs backend --tail=50 || true
+            exit 1
+          elif [ $MIGRATION_EXIT_CODE -eq 2 ]; then
+            echo "⚠️  Migration completed with WARNINGS - deployment will continue"
+            echo "🚨 Post-deployment manual verification required"
+            # Set a variable to remember warnings for final notification
+            echo "MIGRATION_WARNINGS=true" >> $GITHUB_ENV
+          else
+            echo "✅ Migration validation completed successfully"
+          fi
+          
+          # Stop services gracefully
+          echo "⏹️  Stopping services..."
+          docker compose -f docker-compose.prod.yml down --remove-orphans
+          
+          # Start services with new images
+          echo "🚀 Starting services with new images..."
+          docker compose -f docker-compose.prod.yml up -d
+          
+          # Wait for services to initialize
+          echo "⏳ Waiting for services to initialize..."
+          sleep 30
+          
+          # Health checks with proper error handling
+          echo "🏥 Running health checks..."
+          
+          # Backend health check (increased timeout to 4 minutes total)
+          BACKEND_HEALTHY=false
+          for i in {1..48}; do
+            if curl -f -m 10 http://localhost:8000/health >/dev/null 2>&1; then
+              echo "✅ Backend is healthy (attempt $i/48)"
+              BACKEND_HEALTHY=true
+              break
+            else
+              echo "⏳ Backend not ready yet, attempt $i/48..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$BACKEND_HEALTHY" = false ]; then
+            echo "❌ Backend health check failed!"
+            echo "Backend container status:"
+            docker compose -f docker-compose.prod.yml ps backend
+            echo ""
+            echo "=== FULL BACKEND LOGS ==="
+            docker logs $(docker compose -f docker-compose.prod.yml ps -q backend) 2>&1 || echo "Failed to get logs"
+            echo ""
+            echo "=== TESTING APP IMPORT ==="
+            docker compose -f docker-compose.prod.yml exec -T backend python -c "import app.main" 2>&1 || echo "App import failed!"
+            echo ""
+            echo "Checking if backend port is accessible:"
+            docker compose -f docker-compose.prod.yml exec -T backend netstat -tlnp 2>&1 | grep :8000 || echo "Port 8000 not listening"
+            exit 1
+          fi
+          
+          # Frontend health check  
+          FRONTEND_HEALTHY=false
+          for i in {1..12}; do
+            if curl -f -k -m 10 https://ofertator.vautomate.pl/health >/dev/null 2>&1; then
+              echo "✅ Frontend is healthy"
+              FRONTEND_HEALTHY=true
+              break
+            else
+              echo "⏳ Frontend not ready yet, attempt $i/12..."
+              sleep 5
+            fi
+          done
+          
+          if [ "$FRONTEND_HEALTHY" = false ]; then
+            echo "❌ Frontend health check failed!"
+            echo "Nginx logs:"
+            docker compose -f docker-compose.prod.yml logs --tail=30 nginx
+            exit 1
+          fi
+          
+          # Test API connectivity
+          echo "🧪 Testing API connectivity..."
+          if curl -f -m 10 -H "Accept: application/json" http://localhost:8000/api/v1/accounts/ >/dev/null 2>&1; then
+            echo "✅ API is accessible"
+          else
+            echo "⚠️  API test failed, but continuing (may require authentication)"
+          fi
+          
+          # Clean up old images
+          echo "🧹 Cleaning up old images..."
+          docker image prune -f
+          
+          # Final status report
+          echo "📊 Final deployment status:"
+          docker compose -f docker-compose.prod.yml ps
+          
+          # Check for migration warnings
+          if [ "${MIGRATION_WARNINGS:-false}" = "true" ]; then
+            echo "⚠️  ⚠️  ⚠️  DEPLOYMENT WARNING ⚠️  ⚠️  ⚠️"
+            echo "✅ Application deployed successfully BUT with migration warnings!"
+            echo "🚨 REQUIRED ACTION: Verify migration state manually"
+            echo "💡 Check database schema matches expected state"
+            echo "📋 Review migration logs above for specific issues"
+            echo "🌐 Application: https://ofertator.vautomate.pl"
+            echo "📝 Commit: ${{ env.IMAGE_TAG }}"
+            echo "🕒 Deployed at: $(date)"
+            echo "⚠️  ⚠️  ⚠️  END WARNING ⚠️  ⚠️  ⚠️"
+          else
+            echo "✅ Deployment completed successfully!"
+            echo "🌐 Application: https://ofertator.vautomate.pl"
+            echo "📝 Commit: ${{ env.IMAGE_TAG }}"
+            echo "🕒 Deployed at: $(date)"
+          fi
+
+    - name: Rollback on failure
+      if: failure()
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_VM_IP }}
+        username: ${{ secrets.GCP_VM_USER }}
+        key: ${{ secrets.GCP_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok
+          echo "🔄 Deployment failed! Starting rollback..."
+          
+          # Check if migration was the cause of failure
+          echo "🔍 Checking if migration caused the failure..."
+          CURRENT_MIGRATION=$(docker compose -f docker-compose.prod.yml run --rm backend alembic current 2>/dev/null || echo "unknown")
+          echo "Current migration state: $CURRENT_MIGRATION"
+          
+          # Stop current failed deployment
+          docker compose -f docker-compose.prod.yml down --remove-orphans
+          
+          # Try to restore using backup if available
+          if [ -f "deployment_backup.json" ]; then
+            echo "📋 Found deployment backup, attempting restore..."
+            
+            # Extract previous image tags from backup
+            PREV_BACKEND=$(cat deployment_backup.json | jq -r '.[] | select(.Service == "backend") | .Repository + ":" + .Tag' | head -1)
+            PREV_FRONTEND=$(cat deployment_backup.json | jq -r '.[] | select(.Service == "nginx") | .Repository + ":" + .Tag' | head -1)
+            
+            if [ "$PREV_BACKEND" != "null:null" ] && [ "$PREV_FRONTEND" != "null:null" ]; then
+              echo "🔄 Pulling previous images..."
+              docker pull "$PREV_BACKEND" || echo "⚠️  Could not pull previous backend image"
+              docker pull "$PREV_FRONTEND" || echo "⚠️  Could not pull previous frontend image"
+            fi
+          fi
+          
+          # Start services (will use previously cached images if pull failed)
+          echo "🔄 Starting services..."
+          docker compose -f docker-compose.prod.yml up -d
+          
+          # Wait and check if rollback succeeded
+          sleep 30
+          if curl -f -m 10 http://localhost:8000/health >/dev/null 2>&1; then
+            echo "✅ Rollback successful - backend is responding"
+          else
+            echo "❌ Rollback failed - manual intervention required"
+            echo "Recent logs:"
+            docker compose -f docker-compose.prod.yml logs --tail=20
+          fi
+          
+          echo "🔍 Please check the system manually and investigate the deployment failure"
+
+    - name: Cleanup on success
+      if: success()
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.GCP_VM_IP }}
+        username: ${{ secrets.GCP_VM_USER }}
+        key: ${{ secrets.GCP_VM_SSH_KEY }}
+        script: |
+          cd /opt/bot-sok
+          
+          # Remove backup files
+          rm -f deployment_backup.json
+          
+          # Remove old unused images (keep last 3 versions)
+          echo "🧹 Cleaning up old images..."
+          docker image prune -f
+          
+          echo "✨ Cleanup completed"
+
+    - name: Notify deployment result
+      if: always()
+      run: |
+        if [ "${{ job.status }}" = "success" ]; then
+          if [ "${MIGRATION_WARNINGS:-false}" = "true" ]; then
+            echo "⚠️  Deployment successful with MIGRATION WARNINGS!"
+            echo "🚨 Manual verification required for database migrations"
+            echo "🌐 Application: https://ofertator.vautomate.pl"
+            echo "📝 Commit: ${{ env.IMAGE_TAG }}"
+          else
+            echo "✅ Deployment successful!"
+            echo "🌐 Application: https://ofertator.vautomate.pl"
+            echo "📝 Commit: ${{ env.IMAGE_TAG }}"
+          fi
+        else
+          echo "❌ Deployment failed!"
+          echo "📝 Failed commit: ${{ env.IMAGE_TAG }}"
+          echo "🔄 Rollback attempted"
+        fi 

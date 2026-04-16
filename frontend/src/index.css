@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply font-sans antialiased;
+  }
+}
+
+html, body, #root {
+  @apply h-full w-full m-0;
+}
+
+body {
+  @apply bg-gray-100 text-gray-900;
+}
+
+/* Custom scrollbar styling for dark sidebar */
+.sidebar-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.sidebar-scrollbar::-webkit-scrollbar-track {
+  background: #1f2937; /* gray-800 */
+  border-radius: 4px;
+}
+
+.sidebar-scrollbar::-webkit-scrollbar-thumb {
+  background: #4b5563; /* gray-600 */
+  border-radius: 4px;
+}
+
+.sidebar-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #6b7280; /* gray-500 */
+}
+
+/* Firefox scrollbar styling */
+.sidebar-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #4b5563 #1f2937;
+} 

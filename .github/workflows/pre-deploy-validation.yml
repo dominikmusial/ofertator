@@ -1,0 +1,98 @@
+name: Pre-Deploy Validation
+
+on:
+  pull_request:
+    branches: [ staging ]
+  push:
+    branches: [ staging ]
+
+jobs:
+  validate-migrations:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Make scripts executable
+      run: |
+        chmod +x deploy/pre-deploy-check.sh
+        chmod +x deploy/validate-migrations.sh
+    
+    - name: Run pre-deployment validation
+      run: |
+        echo "🔍 Running pre-deployment validation..."
+        ./deploy/pre-deploy-check.sh
+        
+    - name: Validate Docker Compose configuration
+      run: |
+        echo "🐳 Validating Docker Compose files..."
+        docker compose -f docker-compose.yml config
+        docker compose -f docker-compose.prod.yml config
+        
+    - name: Check for migration consistency
+      run: |
+        echo "🔍 Additional migration consistency checks..."
+        
+        # Check for migration files
+        if [ ! -d "backend/alembic/versions" ]; then
+          echo "❌ Alembic versions directory not found"
+          exit 1
+        fi
+        
+        # Count migration files
+        MIGRATION_COUNT=$(find backend/alembic/versions -name "*.py" | grep -v __pycache__ | wc -l)
+        echo "Found $MIGRATION_COUNT migration files"
+        
+        # Check for Python syntax errors
+        find backend/alembic/versions -name "*.py" -exec python3 -m py_compile {} \;
+        
+        echo "✅ Migration files syntax is valid"
+        
+    - name: Lint Python files
+      run: |
+        echo "🧹 Linting Python migration files..."
+        
+        # Install basic linting tools
+        pip install flake8 || true
+        
+        # Lint migration files (allowing some migration-specific patterns)
+        find backend/alembic/versions -name "*.py" -exec flake8 --ignore=E501,W503,E203 {} \; || echo "⚠️ Linting warnings found (non-blocking)"
+        
+    - name: Check environment file templates
+      run: |
+        echo "🔧 Validating environment file templates..."
+        
+        # Check required files exist
+        [ -f ".env.example" ] || (echo "❌ .env.example missing" && exit 1)
+        [ -f "deploy/env.prod.example" ] || (echo "❌ deploy/env.prod.example missing" && exit 1)
+        
+        # Check for required variables
+        REQUIRED_VARS="DATABASE_URL SECRET_KEY POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB"
+        
+        for var in $REQUIRED_VARS; do
+          if ! grep -q "^$var=" deploy/env.prod.example; then
+            echo "❌ Required variable $var missing from deploy/env.prod.example"
+            exit 1
+          fi
+        done
+        
+        echo "✅ Environment templates are valid"
+        
+    - name: Summary
+      if: always()
+      run: |
+        echo "📊 Pre-deployment validation summary:"
+        echo "✅ Migration consistency checked"
+        echo "✅ Docker Compose configuration validated"  
+        echo "✅ Python syntax validated"
+        echo "✅ Environment templates checked"
+        echo ""
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "🎉 All validations passed! Safe to deploy."
+        else
+          echo "❌ Some validations failed. Please fix before deploying."
+        fi
